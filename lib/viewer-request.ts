@@ -8,6 +8,12 @@ function respond(statusCode: number, body: unknown): OverridenResponse {
   };
 }
 
+function isURLEncoded(value: string) {
+  const decoded = decodeURIComponent(value);
+
+  return encodeURIComponent(decoded) === value;
+}
+
 async function handler(
   event: AWSCloudFrontFunction.Event
 ): Promise<AWSCloudFrontFunction.Request | OverridenResponse> {
@@ -44,7 +50,9 @@ async function handler(
     }
   }
 
-  const pathBase64 = Buffer.from(qs.path.value).toString("base64url");
+  const path = qs.path.value;
+  const pathDecoded = isURLEncoded(path) ? decodeURIComponent(path) : path;
+  const pathBase64 = Buffer.from(pathDecoded).toString("base64url");
 
   request.uri = `/${qs.projectId.value}/${pathBase64}/64.json`;
 
