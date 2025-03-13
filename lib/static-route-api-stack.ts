@@ -10,6 +10,8 @@ import {
   aws_events as events,
   aws_events_targets as targets,
   aws_iam as iam,
+  aws_dynamodb as ddb,
+  RemovalPolicy,
 } from "aws-cdk-lib";
 import { Construct } from "constructs";
 
@@ -29,6 +31,8 @@ export class StaticRouteApiStack extends Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       accessControl: s3.BucketAccessControl.PRIVATE,
       cors: [corsRule],
+      removalPolicy: RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
     });
 
     new CfnOutput(this, "BucketName", { value: bucket.bucketName });
@@ -67,14 +71,32 @@ export class StaticRouteApiStack extends Stack {
       value: distribution.distributionDomainName,
     });
 
+    // DynamoDB
+    const mappingTable = new ddb.Table(this, "MappingTable", {
+      partitionKey: { name: "tag", type: ddb.AttributeType.STRING },
+      sortKey: { name: "route", type: ddb.AttributeType.STRING },
+      billingMode: ddb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    mappingTable.addGlobalSecondaryIndex({
+      indexName: "byRoute",
+      partitionKey: { name: "route", type: ddb.AttributeType.STRING },
+    });
+
+    new CfnOutput(this, "MappingTableName", {
+      value: mappingTable.tableName,
+    });
+
     // Lambda
     const scheduledLambda = new lambda.Function(this, "ScheduledLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
       code: lambda.Code.fromAsset("lib/scheduled-lambda"),
       handler: "index.handler",
       memorySize: 1024,
-      timeout: Duration.seconds(60),
+      timeout: Duration.seconds(5 * 60),
       environment: {
+        MAPPING_TABLE_NAME: mappingTable.tableName,
         BUCKET_NAME: bucket.bucketName,
         DISTRIBUTION_ID: distribution.distributionId,
         UNIFORM_ORIGIN: process.env.UNIFORM_ORIGIN || "",
@@ -82,6 +104,12 @@ export class StaticRouteApiStack extends Stack {
         UNIFORM_API_KEY: process.env.UNIFORM_API_KEY || "",
       },
     });
+
+    const lambdaUrl = scheduledLambda.addFunctionUrl({
+      authType: lambda.FunctionUrlAuthType.NONE,
+    });
+
+    new CfnOutput(this, "LambdaUrl", { value: lambdaUrl.url });
 
     scheduledLambda.addToRolePolicy(
       new iam.PolicyStatement({
@@ -105,6 +133,17 @@ export class StaticRouteApiStack extends Stack {
         effect: iam.Effect.ALLOW,
         resources: [
           `arn:aws:cloudfront::${this.account}:distribution/${distribution.distributionId}`,
+        ],
+      })
+    );
+
+    scheduledLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:Query", "dynamodb:BatchWriteItem"],
+        effect: iam.Effect.ALLOW,
+        resources: [
+          `arn:aws:dynamodb:${this.region}:${this.account}:table/${mappingTable.tableName}`,
+          `arn:aws:dynamodb:${this.region}:${this.account}:table/${mappingTable.tableName}/index/byRoute`,
         ],
       })
     );

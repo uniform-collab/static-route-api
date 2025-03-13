@@ -8,6 +8,7 @@
     "clean": "rimraf -v -g {bin,lib}/**/*.{js,d.ts}",
     "build": "tsc lib/*.ts && esbuild lib/scheduled-lambda/index.ts --bundle --minify --platform=node --outfile=lib/scheduled-lambda/index.js",
     "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
     "all": "npm run clean && npm run build && npm run deploy"
   },
   "devDependencies": {
@@ -21,9 +22,11 @@
   },
   "dependencies": {
     "@aws-sdk/client-cloudfront": "3.675.0",
+    "@aws-sdk/client-dynamodb": "3.758.0",
     "@aws-sdk/client-s3": "3.670.0",
     "aws-cdk-lib": "2.162.1",
     "constructs": "10.0.0",
+    "json-stable-stringify": "1.2.1",
     "mkdirp": "3.0.1",
     "rimraf": "6.0.1",
     "s3-sync-client": "4.3.1",

@@ -1,71 +1,113 @@
 import { promises as fs } from "fs";
 import * as nodePath from "path";
-import { z, ZodSchema } from "zod";
 import * as tmp from "tmp";
 import * as rimraf from "rimraf";
 import * as mkdirp from "mkdirp";
-import { S3Client } from "@aws-sdk/client-s3";
-import S3SyncClient, { TransferMonitor } from "s3-sync-client";
 import {
-  CloudFrontClient,
-  CreateInvalidationCommand,
-} from "@aws-sdk/client-cloudfront";
+  DeleteObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import S3SyncClient, { TransferMonitor } from "s3-sync-client";
+import { CloudFrontClient } from "@aws-sdk/client-cloudfront";
+import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { Logger, makeLogger } from "./logger";
+import { request } from "./request";
+import {
+  Dependencies,
+  dependenciesSchema,
+  localesResponseSchema,
+  projectMapNodesResponseSchema,
+  projectMapsResponseSchema,
+  routeResponseSchema,
+} from "./typesAndSchemas";
+import { prepareEnv } from "./env";
+import { tagsFromDependencies, updateTags } from "./tags";
+import { invalidate } from "./invalidation";
 
-async function request<TExpectedType>(
-  origin: string,
-  uri: string,
-  apiKey: string,
-  schema: ZodSchema<TExpectedType>
-): Promise<TExpectedType> {
-  const res = await fetch(`${origin}${uri}`, {
-    headers: { "x-api-key": apiKey },
-  });
+const s3client = new S3Client();
+const dynamoClient = new DynamoDBClient();
+const cloudfrontClient = new CloudFrontClient();
 
-  return schema.parseAsync(await res.json());
-}
+const makeObjectKey = (projectId: string, path: string) =>
+  `${projectId}/${Buffer.from(path).toString("base64url")}/64.json`;
 
-export async function handler() {
+export async function handler(event: unknown) {
+  const logger = makeLogger();
+
+  let dependencies: Dependencies | undefined;
+  if (
+    typeof event === "object" &&
+    event !== null &&
+    !Array.isArray(event) &&
+    "body" in event &&
+    typeof event.body === "string"
+  ) {
+    try {
+      dependencies = dependenciesSchema.parse(JSON.parse(event.body));
+    } catch {
+      logger.info("Body could not be parsed to dependencies, will render all");
+    }
+  }
+
   const tmpDir = nodePath.dirname(tmp.tmpNameSync());
   rimraf.sync(nodePath.join(tmpDir, "**"));
-  console.log("Emptied ", tmpDir);
+  logger.info("Emptied ", tmpDir);
 
   const target = tmp.dirSync({ unsafeCleanup: true });
-  console.log("Created ", target.name);
+  logger.info("Created ", target.name);
 
   try {
-    await renderAndSync(target.name);
-  } catch (err) {
-    console.error("Failed to render and sync", err);
+    if (dependencies) {
+      await renderAffected(dependencies, logger);
+    } else {
+      await renderAndSyncAll(target.name, logger);
+    }
 
-    throw err;
-  } finally {
-    console.log("Cleaning up ", target.name);
-
+    logger.info("Cleaning up ", target.name);
     target.removeCallback();
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ dependencies, logs: logger.logs }),
+      headers: {
+        "content-type": "application/json",
+      },
+    };
+  } catch (err) {
+    logger.error(
+      "Failed to render and sync",
+      err instanceof Error ? err.message : undefined
+    );
+
+    logger.info("Cleaning up ", target.name);
+    target.removeCallback();
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ dependencies, logs: logger.logs }),
+      headers: {
+        "content-type": "application/json",
+      },
+    };
   }
 }
 
-async function renderAndSync(dir: string) {
-  if (
-    !process.env.BUCKET_NAME ||
-    !process.env.DISTRIBUTION_ID ||
-    !process.env.UNIFORM_PROJECT_ID ||
-    !process.env.UNIFORM_API_KEY
-  ) {
-    throw new Error(
-      "Missing one or more of BUCKET_NAME, DISTRIBUTION_ID, UNIFORM_PROJECT_ID, UNIFORM_API_KEY"
-    );
-  }
-
-  const origin = process.env.UNIFORM_ORIGIN || "https://uniform.app";
-  const projectId = process.env.UNIFORM_PROJECT_ID;
-  const apiKey = process.env.UNIFORM_API_KEY;
+async function renderAndSyncAll(dir: string, logger: Logger) {
+  const {
+    mappingTableName,
+    bucketName,
+    distributionId,
+    origin,
+    projectId,
+    apiKey,
+  } = prepareEnv();
 
   const res = await request(
     origin,
     `/api/v1/locales?projectId=${projectId}`,
     apiKey,
-    z.object({ results: z.array(z.object({ locale: z.string() })) })
+    localesResponseSchema
   );
 
   const locales = res.results.map((result) => result.locale);
@@ -74,11 +116,7 @@ async function renderAndSync(dir: string) {
     origin,
     `/api/v1/project-map?projectId=${projectId}`,
     apiKey,
-    z.object({
-      projectMaps: z.array(
-        z.object({ id: z.string(), default: z.boolean().optional() })
-      ),
-    })
+    projectMapsResponseSchema
   );
 
   const projectMapId =
@@ -92,95 +130,158 @@ async function renderAndSync(dir: string) {
     origin,
     `/api/v1/project-map-nodes?projectId=${projectId}&projectMapId=${projectMapId}&expanded=true`,
     apiKey,
-    z.object({
-      nodes: z.array(
-        z.object({
-          id: z.string(),
-          path: z.string(),
-          locales: z
-            .record(z.string(), z.object({ path: z.string().optional() }))
-            .optional(),
-        })
-      ),
-    })
+    projectMapNodesResponseSchema
   );
 
   const pathsToRender = nodes
-    .map(({ locales: nodeLocales, path }) =>
+    .flatMap(({ locales: nodeLocales, path }) =>
       path.includes(":locale")
         ? locales.map((locale) =>
             (nodeLocales?.[locale]?.path ?? path).replace(":locale", locale)
           )
         : path
     )
-    .flat(1)
     .filter((path) => !path.includes(":"));
 
-  console.log(`Writing to ${dir}...`);
+  logger.info(`Writing to ${dir}...`);
 
   for (const path of pathsToRender) {
+    logger.info("Rendering", path);
+
     const res = await request(
       origin.replace(".app", ".global"),
       `/api/v1/route?projectId=${projectId}&state=64&path=${encodeURIComponent(
         path
       )}`,
       apiKey,
-      z.union([
-        z.object({ type: z.literal("notFound") }),
-        z.object({
-          type: z.literal("composition"),
-          matchedRoute: z.string(),
-          dynamicInputs: z.record(z.string(), z.string()),
-          compositionApiResponse: z.unknown(),
-        }),
-        z.object({ type: z.literal("redirect") }),
-      ])
+      routeResponseSchema,
+      { "x-uniform-deps": "true" }
     );
 
     if (res.type === "composition") {
-      const pathBase64 = Buffer.from(path).toString("base64url");
-      const fileName = `${dir}/${projectId}/${pathBase64}/64.json`;
-      const content = JSON.stringify(res);
+      const fileName = `${dir}/${makeObjectKey(projectId, path)}`;
+      const { dependencies, ...rest } = res;
 
       mkdirp.sync(nodePath.dirname(fileName));
-      await fs.writeFile(fileName, content, "utf8");
-      console.log(`Wrote ${fileName}`);
+      await fs.writeFile(fileName, JSON.stringify(rest), "utf8");
+      logger.info(`Wrote ${fileName}`);
     }
+
+    await updateTags({
+      logger,
+      dynamoClient,
+      mappingTableName,
+      projectId,
+      path,
+      dependencies: res.type === "composition" ? res.dependencies : undefined,
+    });
   }
 
-  const client = new S3Client();
-
-  const { sync } = new S3SyncClient({ client });
-
+  const { sync } = new S3SyncClient({ client: new S3Client() });
   const monitor = new TransferMonitor();
-  monitor.on("progress", (progress) => console.log(progress));
+  monitor.on("progress", (progress) => logger.info(progress));
 
-  await sync(
-    `${dir}/${projectId}`,
-    `s3://${process.env.BUCKET_NAME}/${projectId}`,
-    {
-      del: true,
-      monitor,
-      commandInput: () => ({
-        ContentType: "application/json",
-      }),
+  await sync(`${dir}/${projectId}`, `s3://${bucketName}/${projectId}`, {
+    del: true,
+    monitor,
+    commandInput: () => ({ ContentType: "application/json" }),
+  });
+
+  await invalidate({ cloudfrontClient, distributionId, logger, items: ["/*"] });
+}
+
+async function renderAffected(dependencies: Dependencies, logger: Logger) {
+  const {
+    mappingTableName,
+    projectId,
+    apiKey,
+    bucketName,
+    distributionId,
+    origin,
+  } = prepareEnv();
+
+  const tags = tagsFromDependencies(dependencies);
+
+  logger.info("Affected tags", tags);
+
+  const result = await Promise.all(
+    tags.map((tag) =>
+      dynamoClient.send(
+        new QueryCommand({
+          TableName: mappingTableName,
+          ExpressionAttributeValues: {
+            ":v1": { S: [projectId, tag].join("|") },
+          },
+          KeyConditionExpression: "tag = :v1",
+          ProjectionExpression: "route",
+        })
+      )
+    )
+  );
+
+  const pathsToRender = result.flatMap(({ Items }) =>
+    (Items ?? [])
+      .filter((i) => typeof i.route?.S === "string" && i.route.S.includes("|"))
+      .map((i) => i.route.S!.split("|")[1])
+  );
+
+  logger.info("Affected paths", pathsToRender);
+
+  const invalidations = new Set<string>();
+  for (const path of pathsToRender) {
+    logger.info("Rendering", path);
+
+    const res = await request(
+      origin.replace(".app", ".global"),
+      `/api/v1/route?projectId=${projectId}&state=64&path=${encodeURIComponent(
+        path
+      )}`,
+      apiKey,
+      routeResponseSchema,
+      { "x-uniform-deps": "true" }
+    );
+
+    const objectKey = makeObjectKey(projectId, path);
+    invalidations.add(`/${objectKey}`);
+
+    if (res.type !== "composition") {
+      await s3client.send(
+        new DeleteObjectCommand({
+          Bucket: bucketName,
+          Key: objectKey,
+        })
+      );
+
+      logger.info("Deleted object", objectKey);
+    } else {
+      const { dependencies, ...rest } = res;
+
+      await s3client.send(
+        new PutObjectCommand({
+          Bucket: bucketName,
+          Key: objectKey,
+          Body: JSON.stringify(rest),
+          ContentType: "application/json",
+        })
+      );
+
+      logger.info("Written object", objectKey);
     }
-  );
 
-  const cloudfrontClient = new CloudFrontClient();
+    await updateTags({
+      logger,
+      dynamoClient,
+      mappingTableName,
+      projectId,
+      path,
+      dependencies: res.type === "composition" ? res.dependencies : undefined,
+    });
+  }
 
-  console.log("Invalidate distribution", process.env.DISTRIBUTION_ID);
-
-  await cloudfrontClient.send(
-    new CreateInvalidationCommand({
-      DistributionId: process.env.DISTRIBUTION_ID,
-      InvalidationBatch: {
-        CallerReference: Date.now().toString(),
-        Paths: {
-          Quantity: 1,
-          Items: ["/*"],
-        },
-      },
-    })
-  );
+  await invalidate({
+    cloudfrontClient,
+    distributionId,
+    logger,
+    items: Array.from(invalidations),
+  });
 }
